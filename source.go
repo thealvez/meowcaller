@@ -1,6 +1,7 @@
 package meowcaller
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -309,7 +310,10 @@ func OpusFile(path string) (AudioSource, error) {
 	fs := &frameSource{closer: f.Close}
 	fs.more = func() (bool, error) {
 		for {
-			packet, _, err := ogg.ParseNextPacket()
+			packet, err := nextOpusAudioPacket(func() ([]byte, error) {
+				packet, _, parseErr := ogg.ParseNextPacket()
+				return packet, parseErr
+			})
 			if err == io.EOF {
 				return false, nil
 			}
@@ -342,4 +346,17 @@ func OpusFile(path string) (AudioSource, error) {
 		}
 	}
 	return fs, nil
+}
+
+func nextOpusAudioPacket(next func() ([]byte, error)) ([]byte, error) {
+	for {
+		packet, err := next()
+		if err != nil {
+			return nil, err
+		}
+		if len(packet) == 0 || bytes.HasPrefix(packet, []byte("OpusTags")) {
+			continue
+		}
+		return packet, nil
+	}
 }
