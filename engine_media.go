@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/purpshell/meowcaller/mlow"
 	"github.com/purpshell/meowcaller/relay"
 	"github.com/purpshell/meowcaller/rtp"
 	"github.com/purpshell/meowcaller/stun"
@@ -35,7 +34,7 @@ func (e *engine) maybeStartMedia(callID string) {
 	mctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	call := m.call
-	callKey, selfLID, peerLID, rd := m.callKey, m.selfLID, m.peerLID, m.relay
+	callKey, selfLID, peerLID, rd, codec := m.callKey, m.selfLID, m.peerLID, m.relay, m.codec
 	e.mu.Unlock()
 
 	if call != nil {
@@ -43,7 +42,7 @@ func (e *engine) maybeStartMedia(callID string) {
 	}
 	e.c.log.Info().Str("call_id", callID).Msg("starting media")
 	go func() {
-		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd); err != nil {
+		if err := e.runMedia(mctx, callID, call, callKey, selfLID, peerLID, rd, codec); err != nil {
 			e.c.log.Warn().Err(err).Str("call_id", callID).Msg("media ended")
 		}
 	}()
@@ -130,7 +129,7 @@ func (e *engine) connectAndAllocate(ctx context.Context, rd *relayData) (*relay.
 // out with the allocate at t+0, BEFORE any RTP; no STUN binding-requests are ever sent.
 //
 // NOT VALIDATED: live-relay only.
-func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKey []byte, selfLID, peerLID string, rd *relayData) error {
+func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKey []byte, selfLID, peerLID string, rd *relayData, codec AudioCodec) error {
 	log := e.c.log
 	ch, allocate, err := e.connectAndAllocate(ctx, rd)
 	if err != nil {
@@ -166,8 +165,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 		"participant_id": rtp.FormatE2ESrtpParticipantID(selfLID),
 	})
 
-	enc := mlow.NewMlowEncoder(mlow.WithLogger(log))
-	dec := mlow.NewMlowDecoder(mlow.WithLogger(log))
+	enc, dec, err := newWireAudioCodecs(codec, log)
+	if err != nil {
+		return err
+	}
+	log.Info().Str("codec", codec.String()).Str("call_id", callID).Msg("audio codec active")
 	txPipe, err := NewMediaPipeline(callKey, selfLID, peerLID, ssrc, FrameSamples, WithLogger(log))
 	if err != nil {
 		return err
@@ -354,7 +356,7 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 						return fmt.Errorf("relay send binding-success: %w", err)
 					}
 					e.c.diag.Emit("stun", map[string]any{
-						"event": "binding_request_answered",
+						"event":     "binding_request_answered",
 						"tx_id_hex": hex.EncodeToString(tx[:]), "resp_hex": hex.EncodeToString(resp),
 					})
 				}
@@ -408,7 +410,11 @@ func (e *engine) runMedia(ctx context.Context, callID string, call *Call, callKe
 			"event": "frame_unprotected", "ssrc": hdr.Ssrc, "seq": hdr.SequenceNumber,
 			"payload_len": len(payload), "payload_hex": hex.EncodeToString(payload),
 		})
-		frame := dec.Decode(payload)
+		frame, err := dec.Decode(payload)
+		if err != nil {
+			log.Warn().Err(err).Str("codec", codec.String()).Msg("audio payload decode failed")
+			continue
+		}
 		e.c.diag.Emit("media_in", map[string]any{
 			"seq": hdr.SequenceNumber, "samples": len(frame),
 			"pcm_rms": rmsFloat32(frame), "payload_len": len(payload),
